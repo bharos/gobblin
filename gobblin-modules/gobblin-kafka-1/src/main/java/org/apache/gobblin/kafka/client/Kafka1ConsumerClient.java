@@ -77,7 +77,10 @@ public class Kafka1ConsumerClient<K, V> extends AbstractBaseKafkaConsumerClient 
       + CLIENT_KEY_DESERIALIZER_CLASS_KEY;
   public static final String GOBBLIN_CONFIG_VALUE_DESERIALIZER_CLASS_KEY = CONFIG_PREFIX
       + CLIENT_VALUE_DESERIALIZER_CLASS_KEY;
-
+  public static final String CONFIG_KAFKA_POLL_MAX_ATTEMPTS_KEY = CONFIG_PREFIX + "poll.max.attempt.count";
+  private static final int CONFIG_KAFKA_POLL_MAX_ATTEMPT_COUNT_DEFAULT = 3;
+  public static final String CONFIG_KAFKA_POLL_RETRY_INTERVAL_KEY = CONFIG_PREFIX + "poll.retry.interval.ms";
+  private static final int CONFIG_KAFKA_POLL_RETRY_INTERVAL_DEFAULT = 3000;
   private static final Config FALLBACK =
       ConfigFactory.parseMap(ImmutableMap.<String, Object>builder()
           .put(CLIENT_ENABLE_AUTO_COMMIT_KEY, DEFAULT_ENABLE_AUTO_COMMIT)
@@ -86,6 +89,8 @@ public class Kafka1ConsumerClient<K, V> extends AbstractBaseKafkaConsumerClient 
           .build());
 
   private final Consumer<K, V> consumer;
+  private final int pollMaxAttemptCount;
+  private final int pollRetryIntervalMillis;
 
   private Kafka1ConsumerClient(Config config) {
     super(config);
@@ -102,6 +107,11 @@ public class Kafka1ConsumerClient<K, V> extends AbstractBaseKafkaConsumerClient 
     // shared config that start with "gobblin.kafka.sharedConfig"
     Config specificConfig = ConfigUtils.getConfigOrEmpty(baseConfig, CONSUMER_CONFIG).withFallback(
         ConfigUtils.getConfigOrEmpty(config, ConfigurationKeys.SHARED_KAFKA_CONFIG_PREFIX));
+    this.pollMaxAttemptCount =
+        ConfigUtils.getInt(config, CONFIG_KAFKA_POLL_MAX_ATTEMPTS_KEY, CONFIG_KAFKA_POLL_MAX_ATTEMPT_COUNT_DEFAULT);
+    this.pollRetryIntervalMillis =
+        ConfigUtils.getInt(config, CONFIG_KAFKA_POLL_RETRY_INTERVAL_KEY, CONFIG_KAFKA_POLL_RETRY_INTERVAL_DEFAULT);
+
     // The specific config overrides settings in the base config
     Config scopedConfig = specificConfig.withFallback(baseConfig.withoutPath(CONSUMER_CONFIG));
     props.putAll(ConfigUtils.configToProperties(scopedConfig));
@@ -111,6 +121,10 @@ public class Kafka1ConsumerClient<K, V> extends AbstractBaseKafkaConsumerClient 
 
   public Kafka1ConsumerClient(Config config, Consumer<K, V> consumer) {
     super(config);
+    this.pollMaxAttemptCount =
+        ConfigUtils.getInt(config, CONFIG_KAFKA_POLL_MAX_ATTEMPTS_KEY, CONFIG_KAFKA_POLL_MAX_ATTEMPT_COUNT_DEFAULT);
+    this.pollRetryIntervalMillis =
+        ConfigUtils.getInt(config, CONFIG_KAFKA_POLL_RETRY_INTERVAL_KEY, CONFIG_KAFKA_POLL_RETRY_INTERVAL_DEFAULT);
     this.consumer = consumer;
   }
 
@@ -161,15 +175,25 @@ public class Kafka1ConsumerClient<K, V> extends AbstractBaseKafkaConsumerClient 
   @Override
   public Iterator<KafkaConsumerRecord> consume() {
     try {
-      ConsumerRecords<K, V> consumerRecords = consumer.poll(super.fetchTimeoutMillis);
-
-      return Iterators.transform(consumerRecords.iterator(), input -> {
-        try {
-          return new Kafka1ConsumerRecord(input);
-        } catch (Throwable t) {
-          throw Throwables.propagate(t);
+      int pollAttemptsRemaining = this.pollMaxAttemptCount;
+      while (pollAttemptsRemaining-- > 0) {
+        ConsumerRecords<K, V> consumerRecords = consumer.poll(super.fetchTimeoutMillis);
+        if (consumerRecords.count() > 0) {
+          return Iterators.transform(consumerRecords.iterator(), input -> {
+            try {
+              return new Kafka1ConsumerRecord(input);
+            } catch (Throwable t) {
+              throw Throwables.propagate(t);
+            }
+          });
+        } else {
+          log.info("Poll returned 0 records. Sleeping for " + this.pollRetryIntervalMillis
+              + "ms and retrying poll. Poll attempts remaining : " + pollAttemptsRemaining);
+          Thread.sleep(this.pollRetryIntervalMillis);
         }
-      });
+      }
+      log.warn("Poll returned 0 records..");
+      return Iterators.emptyIterator();
     } catch (Exception e) {
       log.error("Exception on polling records", e);
       throw new RuntimeException(e);
@@ -225,7 +249,7 @@ public class Kafka1ConsumerClient<K, V> extends AbstractBaseKafkaConsumerClient 
     consumer.commitAsync(offsets, new OffsetCommitCallback() {
       @Override
       public void onComplete(Map<TopicPartition, OffsetAndMetadata> offsets, Exception exception) {
-        if(exception != null) {
+        if (exception != null) {
           log.error("Exception while committing offsets " + offsets, exception);
           return;
         }
